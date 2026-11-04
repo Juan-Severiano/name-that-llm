@@ -51,3 +51,7 @@ uv run pytest
 
 Os scripts em `scripts/` esperam os dados em `data/` (baixados com a CLI do Kaggle) e a credencial do Kaggle
 em `.env` (fora do repositório).
+
+## Licença
+
+Código sob licença MIT (veja `LICENSE`). Os dados do pool de treino mantêm as licenças de origem, descritas acima.
