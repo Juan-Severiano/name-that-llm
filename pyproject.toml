@@ -1,0 +1,28 @@
+[project]
+name = "name-that-llm"
+version = "0.1.0"
+description = "Classificador que diz qual dos 18 LLMs escreveu um texto (Kaggle: Name That LLM)."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy",
+    "pandas",
+    "protobuf>=7.36.2",
+    "pyarrow",
+    "scikit-learn",
+    "scipy",
+    "sentencepiece>=0.2.2",
+    "torch>=2.15.0",
+    "transformers>=5.22.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "kaggle",
+    "six",
+    "peft>=0.21.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

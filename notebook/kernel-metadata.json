@@ -1,0 +1,20 @@
+{
+  "id": "juanseveriano/name-that-llm-submissao",
+  "title": "name-that-llm-submissao",
+  "code_file": "name-that-llm-submissao.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [
+    "juanseveriano/name-that-llm-encoders",
+    "juanseveriano/name-that-llm-artefatos"
+  ],
+  "competition_sources": [
+    "name-that-llm"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}

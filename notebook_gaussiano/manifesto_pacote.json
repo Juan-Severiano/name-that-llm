@@ -1,0 +1,228 @@
+{
+  "versao": 1,
+  "modelos": {
+    "bge-small-en-v1.5": {
+      "backbone": "BAAI/bge-small-en-v1.5",
+      "camadas": [
+        2,
+        4,
+        6
+      ],
+      "hidden_size": 384,
+      "arquivos": {
+        "config.json": {
+          "bytes": 743,
+          "sha256": "094f8e891b932f2000c92cfc663bac4c62069f5d8af5b5278c4306aef3084750"
+        },
+        "model.safetensors": {
+          "bytes": 133466304,
+          "sha256": "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad"
+        },
+        "special_tokens_map.json": {
+          "bytes": 125,
+          "sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3"
+        },
+        "tokenizer.json": {
+          "bytes": 711396,
+          "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+        },
+        "tokenizer_config.json": {
+          "bytes": 366,
+          "sha256": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3"
+        },
+        "vocab.txt": {
+          "bytes": 231508,
+          "sha256": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+        }
+      }
+    },
+    "roberta-base": {
+      "backbone": "FacebookAI/roberta-base",
+      "camadas": [
+        2,
+        4,
+        6,
+        8,
+        10,
+        12
+      ],
+      "hidden_size": 768,
+      "arquivos": {
+        "config.json": {
+          "bytes": 481,
+          "sha256": "ef0185e2aae6e06c5f105a285006952c340e20c7dbf43c86ec82601b13fc45e9"
+        },
+        "merges.txt": {
+          "bytes": 456318,
+          "sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5"
+        },
+        "model.safetensors": {
+          "bytes": 498818054,
+          "sha256": "5bde1d28afb363d0103324efeb5afc8b2b397fe5e04beabb9b1ef355255ade81"
+        },
+        "tokenizer.json": {
+          "bytes": 1355863,
+          "sha256": "847bbeab6174d66a88898f729d52fa8d355fafe1bea101cf960dd404581df70e"
+        },
+        "tokenizer_config.json": {
+          "bytes": 25,
+          "sha256": "994f46754c5bf4014f1aa92d34b1374319c3a6b3f702105cd5b742beaecd18ce"
+        },
+        "vocab.json": {
+          "bytes": 898823,
+          "sha256": "9e7f63c2d15d666b52e21d250d2e513b87c9b713cfa6987a82ed89e5e6e50655"
+        }
+      }
+    },
+    "deberta-v3-base": {
+      "backbone": "microsoft/deberta-v3-base",
+      "camadas": [
+        4,
+        8,
+        10,
+        11,
+        12
+      ],
+      "hidden_size": 768,
+      "arquivos": {
+        "config.json": {
+          "bytes": 579,
+          "sha256": "649f6a1ec33c6bdd9a6486d5c66019d461139e54957073eafe9bbc2d34c75b0b"
+        },
+        "model.safetensors": {
+          "bytes": 371101258,
+          "sha256": "57cbd0cad054ba5be8d4c6965b836e132f029edbbe3ed9c5bc9ef4fe1c40c34e"
+        },
+        "spm.model": {
+          "bytes": 2464616,
+          "sha256": "c679fbf93643d19aab7ee10c0b99e460bdbc02fedf34b92b05af343b4af586fd"
+        },
+        "tokenizer.json": {
+          "bytes": 8339876,
+          "sha256": "e9ddd853a4a31023721c993458663f2019e3154a05dacf0d2b3c217e53d9bdc8"
+        },
+        "tokenizer_config.json": {
+          "bytes": 466,
+          "sha256": "e546fb51d863e730c4134398f701b596eb43a13d6494e88cc8301bef561d4adb"
+        }
+      }
+    },
+    "Qwen3-0.6B": {
+      "backbone": "Qwen/Qwen3-0.6B",
+      "camadas": [
+        0,
+        4,
+        6,
+        18,
+        20
+      ],
+      "hidden_size": 1024,
+      "arquivos": {
+        "config.json": {
+          "bytes": 726,
+          "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd"
+        },
+        "merges.txt": {
+          "bytes": 1671853,
+          "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+        },
+        "model.safetensors": {
+          "bytes": 1503300328,
+          "sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b"
+        },
+        "tokenizer.json": {
+          "bytes": 11422654,
+          "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        },
+        "tokenizer_config.json": {
+          "bytes": 9732,
+          "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+        },
+        "vocab.json": {
+          "bytes": 2776833,
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
+      }
+    },
+    "StyleDistance_L12": {
+      "backbone": "StyleDistance/styledistance",
+      "camadas": [
+        12
+      ],
+      "hidden_size": 768,
+      "arquivos": {
+        "config.json": {
+          "bytes": 678,
+          "sha256": "b7bcc672f41211775356b1bb7b614453b91edc8425f58eb4ba2c71d6d8b1875a"
+        },
+        "merges.txt": {
+          "bytes": 456318,
+          "sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5"
+        },
+        "model.safetensors": {
+          "bytes": 249313784,
+          "sha256": "6cd0908217a8110f068a1502f7e7157303bffbf965427f4a0b88a48b1b6544b1"
+        },
+        "special_tokens_map.json": {
+          "bytes": 280,
+          "sha256": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f"
+        },
+        "tokenizer.json": {
+          "bytes": 2108643,
+          "sha256": "6e6a06a662f8bce9823abd4c2cda07dcb7e07a84153a2ed190b8d901516b3162"
+        },
+        "tokenizer_config.json": {
+          "bytes": 1215,
+          "sha256": "56f306b23b9233c94016f1b0b8aea3bc120676b378f70933908c9e62ab2daa36"
+        },
+        "vocab.json": {
+          "bytes": 798293,
+          "sha256": "ed19656ea1707df69134c4af35c8ceda2cc9860bf2c3495026153a133670ab5e"
+        }
+      }
+    }
+  },
+  "artefatos": {
+    "fallback.npz": {
+      "bytes": 22490875,
+      "sha256": "f4ba1576f562fe8f0ccffd3d1effb8693ce36ce647e3b7348dbdfbe8beffd038"
+    },
+    "gaussiano/metadados.json": {
+      "bytes": 3822,
+      "sha256": "0021c7baba6432a1725d9bec7a30ebfc92b3a6cfccb20a2cbf63da3e55df1af9"
+    },
+    "gaussiano/parametros.npz": {
+      "bytes": 8325510,
+      "sha256": "dd90029f1cbfe588e88cb2d2d9a21929102a94a2c5b6f832aba40e293e7c021b"
+    },
+    "metadados.json": {
+      "bytes": 2109,
+      "sha256": "86ada923b5aff20dc326990faf43ad66a97e78071c0d36ec1f6a23edea9f18b7"
+    },
+    "tfidf_vocab.json": {
+      "bytes": 1727694,
+      "sha256": "a2fd1c5b72865eb68bf9a14806fe891ad3458209b65b54a738c26c1d09b3467d"
+    }
+  },
+  "dataset_manifesto": {
+    "sha256": "93e48c1213e28f3e745815f8334e42fc30fa1597dc340ad2b0c487484d3e1827",
+    "bytes": 7206,
+    "candidate": "gaussian5_robust",
+    "format_version": 1
+  },
+  "representacao": {
+    "max_length": 512,
+    "dtype_modelo": "float32",
+    "dtype_features": "float16",
+    "pooling": "hidden_states masked mean; todos tokens válidos incluindo especiais; sem L2",
+    "semantica": "bge-small-en-v1.5 hidden_states[12]",
+    "tokens_especiais": "padrão do tokenizer",
+    "eos_manual": false,
+    "camadas_truncadas": false,
+    "autocast": false
+  },
+  "fontes_sha256": {
+    "gaussiano.py": "225c05c31c0ac8822f7561e4888073c44a9f08f4b8bbfe19f4599a511048f172",
+    "gaussiano_robusto.py": "bf55a5aa2cb8c5eecb765e6cdc0193927497076697a635db2cb57bc6e84e7bd0"
+  }
+}
