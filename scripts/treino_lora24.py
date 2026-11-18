@@ -1,0 +1,518 @@
+"""Etapa 1 do LoRA24: Qwen3 nas primeiras 24 camadas, lido em várias profundidades, treinado no pool público e medido
+nos 2.699 textos oficiais, que nunca entram no treino (por isso a nota é uma medida limpa).
+
+Arquitetura da receita pública: LoRA r16 em todas as lineares, média dos tokens em 8 profundidades (cada uma com
+LayerNorm), cabeça linear, gradient checkpointing. Perda: entropia cruzada com amostra do pool balanceada por classe.
+Treina em 1 ou mais GPUs com dados paralelos: cada GPU guarda uma cópia das camadas e os gradientes (só do LoRA e das
+cabeças, ~30 M parâmetros) são somados por all_reduce, com escala de perda dinâmica própria (fp16 na T4), de modo que
+todas as GPUs decidem juntas pular ou aplicar o passo.
+
+Uso: python scripts/treino_lora24.py   (sem RANK no ambiente, ele mesmo lança um processo por GPU; "processos" na config
+força outro número). Local (modelo minúsculo, CPU): TREINO_CFG='{"base": "...", "pool": "...", "oficial": "...",
+"processos": 2}' python scripts/treino_lora24.py
+No Kaggle: notebook gerado por scripts/montar_notebook_treino_lora24.py (internet desligada).
+"""
+
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+from datetime import timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.distributed as dist
+from torch import nn
+
+CFG = {
+    "base": "",  # pasta do modelo; vazio = procurar em /kaggle/input pelo base_spec
+    "base_spec": {"model_type": "qwen3", "hidden_size": 4096, "num_hidden_layers": 36},
+    "tokenizer": "",  # vazio = o da base
+    "keep": 24,
+    "layers": [2, 4, 6, 8, 12, 16, 20, 24],
+    "r": 16,
+    "max_len": 384,
+    "pool": "",  # vazio = procurar ntl_open_pool.parquet em /kaggle/input
+    "oficial": "",  # vazio = procurar train.csv em /kaggle/input
+    "n_pool_por_classe": 1944,  # 18 x 1944 = 34.992 textos
+    "excluir_proxy_pos_regra": True,  # linhas geradas pelo proxy do Kaggle depois da regra do host (28/10)
+    "micro_lote": 8,  # por GPU
+    "acumular": 1,
+    "epocas": 1,
+    "lr_nucleo": 1e-4,
+    "lr_cabeca": 1e-3,
+    "aquecimento_frac": 0.10,
+    "escala_inicial": 1024.0,  # escala da perda em fp16; em fp32 não se usa
+    "max_passos": 0,  # 0 = até acabar as épocas
+    "avaliar_cada": 500,  # passos; 0 desliga
+    "avaliar_n": 400,  # textos oficiais nas avaliações intermediárias
+    "avaliar_final_n": 0,  # 0 = todos os 2.699 oficiais
+    "salvar_cada": 500,
+    "tempo_maximo_s": 10800,
+    "saida": "/kaggle/working",
+    "backend": "",  # vazio = nccl com CUDA, gloo sem
+    "timeout_min": 30,
+    "processos": 0,  # 0 = um por GPU visível (ou 1 sem GPU)
+    "perfil_passos": False,  # mede tempos por passo (forward/backward, espera entre GPUs, all_reduce); só no check
+}
+CFG_JSON = "{}"  # o gerador do notebook troca esta linha
+CFG.update(json.loads(os.environ.get("TREINO_CFG", CFG_JSON)))
+
+RANK = int(os.environ.get("RANK", 0))
+MUNDO = int(os.environ.get("WORLD_SIZE", 1))
+LOCAL = int(os.environ.get("LOCAL_RANK", 0))
+T0 = time.time()
+
+
+def log(*args):
+    if RANK == 0:
+        print(f"[{time.time() - T0:6.0f}s]", *args, flush=True)
+
+
+def preparar_ambiente():
+    """O peft do Kaggle exige torchao >= 0.16 e a imagem traz o 0.10; sem o torchao o peft simplesmente não o usa."""
+    import importlib.metadata as md
+
+    try:
+        versao = md.version("torchao")
+    except md.PackageNotFoundError:
+        return
+    if tuple(int(x) for x in versao.split(".")[:2]) < (0, 16):
+        log(f"torchao {versao} incompatível com o peft: removendo")
+        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q", "torchao"], check=True)
+
+
+def achar(padrao: str) -> str:
+    achados = sorted(Path("/kaggle/input").rglob(padrao))
+    if not achados:
+        raise FileNotFoundError(f"{padrao} não encontrado em /kaggle/input")
+    return str(achados[0])
+
+
+def achar_base() -> str:
+    if CFG["base"]:
+        return CFG["base"]
+    spec = CFG["base_spec"]
+    for cfg in sorted(Path("/kaggle/input").rglob("config.json")):
+        try:
+            c = json.loads(cfg.read_text())
+        except Exception:
+            continue
+        if all(c.get(k) == v for k, v in spec.items()):
+            return str(cfg.parent)
+    raise FileNotFoundError(f"modelo {spec} não encontrado em /kaggle/input")
+
+
+def normalizar(texto: str) -> str:
+    return " ".join(texto.split()).lower()
+
+
+def carregar_dados(tok):
+    oficial = pd.read_csv(CFG["oficial"] or achar("train.csv"), keep_default_na=False)
+    classes = sorted(oficial.model.unique())
+    assert len(classes) == 18, f"{len(classes)} classes nos oficiais"
+    pool = pd.read_parquet(CFG["pool"] or achar("ntl_open_pool.parquet"),
+                           columns=["text", "model", "n_words", "flag_kb_proxy_after_ruling"])
+    n0 = len(pool)
+    pool = pool[pool.n_words.between(30, 300)]
+    if CFG["excluir_proxy_pos_regra"]:
+        pool = pool[~pool.flag_kb_proxy_after_ruling.astype(bool)]
+    oficiais = {normalizar(t) for t in oficial.text}  # nenhum texto oficial pode estar no treino
+    pool = pool[~pool.text.map(normalizar).isin(oficiais)].drop_duplicates("text")
+    assert set(pool.model) <= set(classes), f"classes do pool fora das oficiais: {set(pool.model) - set(classes)}"
+    amostra = pd.concat([g.sample(min(len(g), CFG["n_pool_por_classe"]), random_state=0) for _, g in pool.groupby("model")])
+    amostra = amostra.sample(frac=1, random_state=0).reset_index(drop=True)
+    log(f"pool: {n0} linhas, {len(pool)} após filtros, {len(amostra)} na amostra balanceada "
+        f"({amostra.model.value_counts().min()} a {amostra.model.value_counts().max()} por classe)")
+
+    def tokenizar(textos):
+        bruto = tok([t.strip() for t in textos], add_special_tokens=False)["input_ids"]
+        return [x[: CFG["max_len"] - 1] + [tok.eos_token_id] for x in bruto]
+
+    indice = {c: i for i, c in enumerate(classes)}
+    return (tokenizar(amostra.text), amostra.model.map(indice).to_numpy(),
+            tokenizar(oficial.text), oficial.model.map(indice).to_numpy(), classes)
+
+
+class Leitor(nn.Module):
+    """Camadas do Qwen3 com LoRA, média dos tokens em várias profundidades (cada uma com LayerNorm) e cabeça linear."""
+
+    def __init__(self, trunk, layers, hidden, n_classes):
+        super().__init__()
+        self.trunk, self.layers = trunk, layers
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in layers])
+        self.head = nn.Linear(hidden * len(layers), n_classes)
+
+    def forward(self, ids, mask):
+        hs = self.trunk(input_ids=ids, attention_mask=mask, output_hidden_states=True, use_cache=False).hidden_states
+        assert len(hs) == CFG["keep"] + 1, f"hidden_states com {len(hs)} entradas, esperado {CFG['keep'] + 1}"
+        m = mask.float().clone()
+        m[:, 0] = 0  # o primeiro token é um "attention sink": fora da média
+        m = m.unsqueeze(-1)
+        den = m.sum(1).clamp(min=1)
+        z = torch.cat([nm((hs[l].float() * m).sum(1) / den) for l, nm in zip(self.layers, self.norms)], -1)
+        return self.head(z)
+
+
+def montar_modelo(base, dispositivo, tipo, n_classes):
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import AutoConfig, AutoModel
+
+    mc = AutoConfig.from_pretrained(base)
+    mc.num_hidden_layers, mc.use_cache = CFG["keep"], False
+    if getattr(mc, "layer_types", None) is not None:
+        mc.layer_types = mc.layer_types[: CFG["keep"]]
+    if dispositivo.startswith("cuda"):
+        trunk = AutoModel.from_pretrained(base, config=mc, dtype=tipo, device_map={"": LOCAL})
+    else:
+        trunk = AutoModel.from_pretrained(base, config=mc, dtype=tipo).to(dispositivo)
+    trunk.norm = nn.Identity()  # a receita pública lê a camada 24 sem a normalização final
+    trunk.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    trunk.enable_input_require_grads()
+    lora = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION, r=CFG["r"], lora_alpha=2 * CFG["r"], lora_dropout=0.05,
+                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+    trunk = get_peft_model(trunk, lora)
+    for p in trunk.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()  # só o adaptador treina, em fp32
+    leitor = Leitor(trunk, CFG["layers"], mc.hidden_size, n_classes)
+    leitor.norms.to(dispositivo)
+    leitor.head.to(dispositivo)
+    treinaveis = sum(p.numel() for p in leitor.parameters() if p.requires_grad)
+    log(f"modelo com {CFG['keep']} camadas em {dispositivo}/{tipo}, treináveis {treinaveis / 1e6:.1f} M, {MUNDO} GPU(s)")
+    return leitor
+
+
+def parametros_treinaveis(leitor):
+    nucleo = [p for n, p in leitor.named_parameters() if p.requires_grad and n.startswith("trunk")]
+    cabeca = [p for n, p in leitor.named_parameters() if p.requires_grad and not n.startswith("trunk")]
+    return nucleo, cabeca
+
+
+def lotes(ids, tamanho, rng, mundo=1):
+    """Lista global de lotes (iguais em todas as GPUs): tamanhos parecidos juntos, ordem embaralhada.
+    Com várias GPUs, cada grupo de `mundo` lotes seguidos (um por GPU, no mesmo passo) tem comprimentos parecidos:
+    sem isso cada passo espera o lote mais longo dos sorteados (medido: +26% de tempo com 2 GPUs)."""
+    ordem = rng.permutation(len(ids))
+    saida = []
+    for i in range(0, len(ids), tamanho * 50):
+        bloco = sorted(ordem[i : i + tamanho * 50], key=lambda j: len(ids[j]))
+        saida += [bloco[k : k + tamanho] for k in range(0, len(bloco), tamanho)]
+    saida = [b for b in saida if len(b) == tamanho]
+    if mundo == 1:
+        rng.shuffle(saida)
+        return saida
+    saida.sort(key=lambda b: max(len(ids[i]) for i in b))
+    grupos = [saida[k : k + mundo] for k in range(0, len(saida) - mundo + 1, mundo)]
+    for grupo in grupos:
+        rng.shuffle(grupo)  # a mesma GPU não fica sempre com o lote mais curto do par
+    rng.shuffle(grupos)
+    return [b for grupo in grupos for b in grupo]
+
+
+def sincronizar(dispositivo):
+    if dispositivo.startswith("cuda"):
+        torch.cuda.synchronize()
+    elif dispositivo == "mps":
+        torch.mps.synchronize()
+
+
+def montar_lote(ids, indices, pad, dispositivo):
+    maior = max(len(ids[i]) for i in indices)
+    x = torch.full((len(indices), maior), pad, dtype=torch.long)
+    m = torch.zeros((len(indices), maior), dtype=torch.long)
+    for k, i in enumerate(indices):
+        x[k, : len(ids[i])] = torch.tensor(ids[i])
+        m[k, : len(ids[i])] = 1
+    return x.to(dispositivo), m.to(dispositivo)
+
+
+@torch.no_grad()
+def prever(leitor, ids, pad, dispositivo, tipo, tamanho=16):
+    """Logits de todos os textos; cada GPU faz uma fatia (i % mundo == rank) e as fatias são reunidas."""
+    leitor.eval()
+    if dispositivo.startswith("cuda"):
+        torch.cuda.empty_cache()
+    n = len(ids)
+    meus = np.arange(n)[RANK::MUNDO]
+    k = math.ceil(n / MUNDO)
+    local = torch.zeros((k, 18), device=dispositivo)
+    ordem = sorted(range(len(meus)), key=lambda j: len(ids[meus[j]]))
+    tipo_disp = dispositivo.split(":")[0]
+    for a in range(0, len(ordem), tamanho):
+        pos = ordem[a : a + tamanho]
+        x, m = montar_lote(ids, [meus[j] for j in pos], pad, dispositivo)
+        with torch.autocast(device_type=tipo_disp, dtype=tipo, enabled=tipo != torch.float32):
+            local[pos] = leitor(x, m).float()
+    if MUNDO > 1:
+        partes = [torch.zeros_like(local) for _ in range(MUNDO)]
+        dist.all_gather(partes, local)
+    else:
+        partes = [local]
+    saida = np.zeros((n, 18), dtype=np.float32)
+    for r in range(MUNDO):
+        quantos = len(np.arange(n)[r::MUNDO])
+        saida[np.arange(n)[r::MUNDO]] = partes[r][:quantos].cpu().numpy()
+    leitor.train()
+    return saida
+
+
+def nota(y, logits):
+    y = np.asarray(y)
+    previsto = logits.argmax(1)
+    return float(np.mean([(previsto[y == c] == c).mean() for c in np.unique(y)]))
+
+
+def passo_otimizador(todos, otimizador, escala):
+    """Soma os gradientes entre as GPUs, tira a escala, corta a norma e aplica. Retorna (aplicou, norma).
+    Todas as GPUs recebem o mesmo vetor somado, então decidem igual: se uma teve inf/nan, todas pulam."""
+    grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in todos]
+    plano = torch.cat([g.reshape(-1) for g in grads])
+    if MUNDO > 1:
+        dist.all_reduce(plano)
+    plano /= escala * MUNDO
+    norma = plano.norm()
+    if not bool(torch.isfinite(norma)):
+        return False, float("nan")
+    plano *= min(1.0, 1.0 / (float(norma) + 1e-6))
+    inicio = 0
+    for p, g in zip(todos, grads):
+        p.grad = plano[inicio : inicio + g.numel()].view_as(g).clone()
+        inicio += g.numel()
+    otimizador.step()
+    return True, float(norma)
+
+
+def treinar(leitor, ids, y, ids_of, y_of, pad, dispositivo, tipo, resultado):
+    nucleo, cabeca = parametros_treinaveis(leitor)
+    todos = nucleo + cabeca
+    otimizador = torch.optim.AdamW([{"params": nucleo, "lr": CFG["lr_nucleo"]}, {"params": cabeca, "lr": CFG["lr_cabeca"]}],
+                                   weight_decay=0.0)
+    base_lr = [CFG["lr_nucleo"], CFG["lr_cabeca"]]
+    fp16 = tipo == torch.float16
+    escala = float(CFG["escala_inicial"]) if fp16 else 1.0
+    por_passo = MUNDO * CFG["acumular"]
+    passos_epoca = len(lotes(ids, CFG["micro_lote"], np.random.default_rng(1), MUNDO)) // por_passo
+    total = passos_epoca * CFG["epocas"]
+    if CFG["max_passos"]:
+        total = min(total, CFG["max_passos"])
+    aquec = max(1, int(CFG["aquecimento_frac"] * total))
+    tipo_disp = dispositivo.split(":")[0]
+    yt = torch.as_tensor(y, dtype=torch.long)
+    avaliar_idx = np.random.default_rng(2).permutation(len(ids_of))[: CFG["avaliar_n"]]
+    ids_av, y_av = [ids_of[i] for i in avaliar_idx], y_of[avaliar_idx]
+    resultado.update(passos_total_previsto=total, passos_por_epoca=passos_epoca, avaliacoes=[], historico_perda=[])
+    log(f"{len(ids)} textos, {passos_epoca} passos por época, {total} passos no total, micro-lote {CFG['micro_lote']} por GPU")
+
+    leitor.train()
+    passo, tokens, perda_media, pulados, bons_seguidos = 0, 0, None, 0, 0
+    t_aval = 0.0  # tempo gasto avaliando: fora da velocidade de treino
+    perfil, acum = CFG["perfil_passos"], {"passos": 0, "fwbw_s": 0.0, "espera_s": 0.0, "all_reduce_e_otimizador_s": 0.0}
+    t_ini = time.time()
+    parar = False
+    for epoca in range(CFG["epocas"]):
+        fila = lotes(ids, CFG["micro_lote"], np.random.default_rng(1 + epoca), MUNDO)
+        for g in range(passos_epoca):
+            if passo >= total or parar:
+                break
+            fator = min(1.0, (passo + 1) / aquec) * 0.5 * (1 + math.cos(math.pi * passo / max(1, total)))
+            for grupo, lr in zip(otimizador.param_groups, base_lr):
+                grupo["lr"] = lr * fator
+            t_a = time.time()
+            for a in range(CFG["acumular"]):
+                indices = fila[(g * CFG["acumular"] + a) * MUNDO + RANK]
+                x, m = montar_lote(ids, indices, pad, dispositivo)
+                with torch.autocast(device_type=tipo_disp, dtype=tipo, enabled=tipo != torch.float32):
+                    logits = leitor(x, m)
+                perda = torch.nn.functional.cross_entropy(logits.float(), yt[indices].to(dispositivo))
+                (perda * escala / CFG["acumular"]).backward()
+                tokens += int(m.sum())
+                v = float(perda)
+                if math.isfinite(v):
+                    perda_media = v if perda_media is None else 0.98 * perda_media + 0.02 * v
+            if perfil:  # separa: forward/backward, espera pela outra GPU (desbalanceamento) e all_reduce + otimizador
+                sincronizar(dispositivo)
+                t_b = time.time()
+                if MUNDO > 1:
+                    dist.barrier()
+                    sincronizar(dispositivo)
+                t_c = time.time()
+            aplicou, _ = passo_otimizador(todos, otimizador, escala)
+            otimizador.zero_grad(set_to_none=True)
+            if perfil:
+                sincronizar(dispositivo)
+                if passo >= 3:  # sem o aquecimento do CUDA
+                    acum["passos"] += 1
+                    acum["fwbw_s"] += t_b - t_a
+                    acum["espera_s"] += t_c - t_b
+                    acum["all_reduce_e_otimizador_s"] += time.time() - t_c
+            if aplicou:
+                bons_seguidos += 1
+                if fp16 and bons_seguidos >= 200 and escala < 2 ** 16:
+                    escala, bons_seguidos = escala * 2, 0
+            else:
+                pulados += 1
+                bons_seguidos = 0
+                if fp16:
+                    escala = max(1.0, escala / 2)
+                log(f"passo {passo}: gradiente não finito, passo pulado; escala {escala:g}")
+            passo += 1
+            if passo % 20 == 0:
+                dt = time.time() - t_ini - t_aval
+                resultado["historico_perda"].append([passo, perda_media])
+                eta = dt / passo * (total - passo)
+                log(f"passo {passo}/{total} perda {perda_media:.3f} {tokens * MUNDO / dt:.0f} tokens/s (todas as GPUs) "
+                    f"escala {escala:g} pulados {pulados} ETA {eta / 60:.0f} min")
+                if MUNDO > 1:  # as GPUs decidem juntas parar por tempo
+                    flag = torch.tensor([1.0 if time.time() - T0 > CFG["tempo_maximo_s"] else 0.0], device=dispositivo)
+                    dist.broadcast(flag, 0)
+                    parar = bool(flag.item())
+                else:
+                    parar = time.time() - T0 > CFG["tempo_maximo_s"]
+                if parar:
+                    log(f"tempo máximo atingido no passo {passo}")
+            if CFG["avaliar_cada"] and passo % CFG["avaliar_cada"] == 0:
+                t_e = time.time()
+                ba = nota(y_av, prever(leitor, ids_av, pad, dispositivo, tipo))
+                t_aval += time.time() - t_e
+                resultado["avaliacoes"].append({"passo": passo, "balanced_accuracy": ba, "textos": len(ids_av)})
+                log(f"AVALIAÇÃO passo {passo}: balanced accuracy {ba:.4f} em {len(ids_av)} textos oficiais")
+            if CFG["salvar_cada"] and passo % CFG["salvar_cada"] == 0:
+                salvar(leitor)
+        if passo >= total or parar:
+            break
+    dt = time.time() - t_ini - t_aval
+    resultado.update(passos=passo, passos_pulados=pulados, escala_final=escala, tempo_treino_s=dt, tempo_avaliacao_s=t_aval,
+                     tokens_por_s_todas_gpus=tokens * MUNDO / dt, perda_final=perda_media)
+    if perfil and acum["passos"]:
+        n = acum["passos"]
+        resultado["perfil_passos"] = {"passos_medidos": n, "fwbw_s": acum["fwbw_s"] / n, "espera_barreira_s": acum["espera_s"] / n,
+                                      "all_reduce_e_otimizador_s": acum["all_reduce_e_otimizador_s"] / n}
+        log("PERFIL por passo:", json.dumps({k: round(v, 3) for k, v in resultado["perfil_passos"].items()}))
+
+
+def salvar(leitor):
+    if RANK != 0:
+        return
+    saida = Path(CFG["saida"])
+    leitor.trunk.save_pretrained(saida / "adaptador")
+    torch.save({"norms": leitor.norms.state_dict(), "head": leitor.head.state_dict()}, saida / "cabecas.pt")
+
+
+def main():
+    from transformers import AutoTokenizer
+
+    saida = Path(CFG["saida"])
+    saida.mkdir(parents=True, exist_ok=True)
+    cuda = torch.cuda.is_available()
+    if cuda:
+        dispositivo, tipo = f"cuda:{LOCAL}", torch.float16  # T4 não tem bf16 nativo
+        torch.cuda.set_device(LOCAL)
+    elif MUNDO == 1 and torch.backends.mps.is_available() and os.environ.get("TREINO_MPS"):
+        dispositivo, tipo = "mps", torch.bfloat16
+    else:
+        dispositivo, tipo = "cpu", torch.float32
+    if MUNDO > 1:
+        backend = CFG["backend"] or ("nccl" if cuda else "gloo")
+        dist.init_process_group(backend=backend, timeout=timedelta(minutes=CFG["timeout_min"]))
+        log(f"distribuído: backend {backend}, {MUNDO} processos")
+    if RANK == 0:
+        preparar_ambiente()
+    if MUNDO > 1:
+        dist.barrier()
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    base = achar_base()
+    tok = AutoTokenizer.from_pretrained(CFG["tokenizer"] or base)
+    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    ids, y, ids_of, y_of, classes = carregar_dados(tok)
+    log(f"{np.mean([len(i) for i in ids]):.0f} tokens por texto do pool em média; {len(ids_of)} textos oficiais para avaliar")
+    t_carga = time.time()
+    leitor = montar_modelo(base, dispositivo, tipo, len(classes))
+    if MUNDO > 1:  # mesmas cabeças e mesmo LoRA em todas as GPUs, mesmo que a inicialização divirja
+        for p in sum(parametros_treinaveis(leitor), []):
+            dist.broadcast(p.data, 0)
+    resultado = {"config": CFG, "classes": classes, "mundo": MUNDO, "carregamento_s": time.time() - t_carga,
+                 "dispositivo": dispositivo}
+    if cuda:
+        resultado["gpu"] = torch.cuda.get_device_name(LOCAL)
+
+    treinar(leitor, ids, y, ids_of, y_of, pad, dispositivo, tipo, resultado)
+
+    # as GPUs têm de terminar com os mesmos parâmetros treináveis
+    soma = torch.stack([p.detach().double().sum() for p in sum(parametros_treinaveis(leitor), [])]).sum().reshape(1)
+    somas = [torch.zeros_like(soma) for _ in range(MUNDO)]
+    if MUNDO > 1:
+        dist.all_gather(somas, soma)
+    else:
+        somas[0] = soma
+    resultado["diferenca_params_entre_gpus"] = float(max(s.item() for s in somas) - min(s.item() for s in somas))
+    salvar(leitor)
+
+    idx = np.arange(len(ids_of))[: CFG["avaliar_final_n"] or len(ids_of)]
+    logits = prever(leitor, [ids_of[i] for i in idx], pad, dispositivo, tipo)
+    yv = y_of[idx]
+    previsto = logits.argmax(1)
+    familia = np.array([c.split("-")[0] for c in classes])
+    resultado["final"] = {
+        "textos": int(len(idx)), "balanced_accuracy": nota(yv, logits),
+        "acuracia_familia": float((familia[previsto] == familia[yv]).mean()),
+        "recall_por_classe": {classes[c]: float((previsto[yv == c] == c).mean()) for c in np.unique(yv)},
+    }
+    if RANK == 0:
+        np.save(saida / "logits_oficial.npy", logits)
+        np.save(saida / "y_oficial.npy", yv)
+        (saida / "resultado.json").write_text(json.dumps(resultado, indent=2))
+    log("FINAL balanced accuracy nos oficiais:", round(resultado["final"]["balanced_accuracy"], 4),
+        "| família:", round(resultado["final"]["acuracia_familia"], 4),
+        "| passos pulados:", resultado["passos_pulados"], "| diferença entre GPUs:", resultado["diferenca_params_entre_gpus"])
+    if MUNDO > 1:
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def lancar() -> int:
+    """Lança um processo por GPU com o ambiente que o init_process_group espera (endereço fixo em 127.0.0.1: o
+    torchrun --standalone trava no macOS ao resolver o hostname). Se um processo cair, derruba os outros."""
+    import shutil
+    import socket
+
+    if CFG["processos"]:
+        n = CFG["processos"]
+    else:
+        listagem = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True) if shutil.which("nvidia-smi") else None
+        n = max(1, sum(1 for linha in (listagem.stdout.splitlines() if listagem else []) if linha.startswith("GPU ")))
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        porta = s.getsockname()[1]
+    env = dict(os.environ, WORLD_SIZE=str(n), MASTER_ADDR="127.0.0.1", MASTER_PORT=str(porta), TREINO_CFG=json.dumps(CFG))
+    env.setdefault("GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo")
+    print(f"lançando {n} processo(s)", flush=True)
+    procs = [subprocess.Popen([sys.executable, str(Path(__file__).resolve())],
+                              env=dict(env, RANK=str(i), LOCAL_RANK=str(i))) for i in range(n)]
+    while True:
+        codigos = [p.poll() for p in procs]
+        if all(c is not None for c in codigos):
+            break
+        if any(c not in (None, 0) for c in codigos):
+            print(f"um processo terminou com erro {codigos}: derrubando os outros", flush=True)
+            for p in procs:
+                if p.poll() is None:
+                    p.terminate()
+            break
+        time.sleep(2)
+    codigos = [p.wait() for p in procs]
+    print("códigos de saída:", codigos, flush=True)
+    return 0 if all(c == 0 for c in codigos) else 1
+
+
+if __name__ == "__main__":
+    if "RANK" in os.environ:
+        main()
+    else:
+        sys.exit(lancar())
