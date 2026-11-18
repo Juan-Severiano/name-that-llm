@@ -91,3 +91,35 @@ def test_lotes_pareados_por_comprimento_tiram_a_espera_entre_gpus():
     usados = [i for b in com for i in b]  # nenhum texto repetido, todos os lotes completos
     assert len(usados) == len(set(usados)) == len(com) * 8 and all(len(b) == 8 for b in com)
     assert len(com) % 2 == 0 and abs(len(com) - len(sem)) <= 1
+
+
+def rodar_script(cfg, tmp_path):
+    r = subprocess.run([sys.executable, str(RAIZ / "scripts/treino_lora24.py")], capture_output=True, text=True, timeout=420,
+                       env={"TREINO_CFG": json.dumps(cfg), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path)})
+    assert r.returncode == 0, r.stdout[-2500:] + r.stderr[-3500:]
+    return r
+
+
+@pytest.mark.skipif(not TOKENIZADOR.exists(), reason="tokenizador local do Qwen3-0.6B ausente")
+def test_etapa2_retoma_a_etapa1_e_mede_as_mesmas_passagens_antes_e_depois(tmp_path):
+    pytest.importorskip("peft")
+    modelo_minusculo(tmp_path / "base")
+    dados_falsos(tmp_path)
+    comum = {"base": str(tmp_path / "base"), "tokenizer": str(TOKENIZADOR), "oficial": str(tmp_path / "train.csv"), "keep": 4,
+             "layers": [1, 2, 3, 4], "micro_lote": 2, "timeout_min": 2, "processos": 2, "avaliar_cada": 0, "salvar_cada": 0}
+    etapa1 = tmp_path / "etapa1"
+    rodar_script(comum | {"pool": str(tmp_path / "pool.parquet"), "n_pool_por_classe": 8, "max_passos": 4, "saida": str(etapa1)},
+                 tmp_path)
+    etapa2 = tmp_path / "etapa2"
+    rodar_script(comum | {"etapa": 2, "inicio": str(etapa1), "logits_etapa1": str(etapa1 / "logits_oficial.npy"),
+                          "dobras": [0, 1], "n_dobras": 3, "epocas": 1, "lr_nucleo": 5e-5, "lr_cabeca": 5e-4,
+                          "final_todos": True, "saida": str(etapa2)}, tmp_path)
+    res = json.loads((etapa2 / "resultado.json").read_text())
+    assert res["retomada"]["concordancia_argmax"] == 1.0  # carregou o adaptador e as cabeças da etapa 1
+    assert [d["dobra"] for d in res["dobras"]] == [0, 1]
+    assert all(d["avaliacao"] == 18 and d["treino"] == 36 and d["passos_pulados"] == 0 for d in res["dobras"])
+    p = res["pareado"]
+    assert p["passagens"] == 36 and p["prompts"] == 2 and len(p["ic95_delta_por_prompt"]) == 2
+    assert abs(p["delta"] - (p["ba_depois"] - p["ba_antes"])) < 1e-12
+    assert res["final_todos"]["treino"] == 54
+    assert (etapa2 / "adaptador_etapa2/adapter_config.json").exists() and (etapa2 / "cabecas_etapa2.pt").exists()

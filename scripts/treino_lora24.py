@@ -58,6 +58,13 @@ CFG = {
     "timeout_min": 30,
     "processos": 0,  # 0 = um por GPU visível (ou 1 sem GPU)
     "perfil_passos": False,  # mede tempos por passo (forward/backward, espera entre GPUs, all_reduce); só no check
+    # etapa 2: retoma o adaptador e as cabeças da etapa 1 e ajusta nos textos do host, reservando prompts inteiros
+    "etapa": 1,
+    "inicio": "",  # pasta com adaptador/ e cabecas.pt da etapa 1; vazio = procurar cabecas.pt em /kaggle/input
+    "logits_etapa1": "",  # logits_oficial.npy da etapa 1 (confere a retomada); vazio = procurar em /kaggle/input
+    "dobras": [0, 1],  # dobras por prompt reservadas, uma de cada vez: prompts[k::n_dobras]
+    "n_dobras": 5,
+    "final_todos": False,  # depois das dobras, ajusta em todos os oficiais e salva adaptador_etapa2/ (sem avaliação)
 }
 CFG_JSON = "{}"  # o gerador do notebook troca esta linha
 CFG.update(json.loads(os.environ.get("TREINO_CFG", CFG_JSON)))
@@ -111,10 +118,20 @@ def normalizar(texto: str) -> str:
     return " ".join(texto.split()).lower()
 
 
-def carregar_dados(tok):
+def carregar_dados(tok, com_pool=True):
     oficial = pd.read_csv(CFG["oficial"] or achar("train.csv"), keep_default_na=False)
     classes = sorted(oficial.model.unique())
     assert len(classes) == 18, f"{len(classes)} classes nos oficiais"
+    indice = {c: i for i, c in enumerate(classes)}
+
+    def tokenizar(textos):
+        bruto = tok([t.strip() for t in textos], add_special_tokens=False)["input_ids"]
+        return [x[: CFG["max_len"] - 1] + [tok.eos_token_id] for x in bruto]
+
+    ids_of, y_of = tokenizar(oficial.text), oficial.model.map(indice).to_numpy()
+    prompts = oficial.prompt_id.astype(str).to_numpy()
+    if not com_pool:  # etapa 2 só usa os oficiais
+        return [], np.zeros(0, dtype=int), ids_of, y_of, classes, prompts
     pool = pd.read_parquet(CFG["pool"] or achar("ntl_open_pool.parquet"),
                            columns=["text", "model", "n_words", "flag_kb_proxy_after_ruling"])
     n0 = len(pool)
@@ -128,14 +145,7 @@ def carregar_dados(tok):
     amostra = amostra.sample(frac=1, random_state=0).reset_index(drop=True)
     log(f"pool: {n0} linhas, {len(pool)} após filtros, {len(amostra)} na amostra balanceada "
         f"({amostra.model.value_counts().min()} a {amostra.model.value_counts().max()} por classe)")
-
-    def tokenizar(textos):
-        bruto = tok([t.strip() for t in textos], add_special_tokens=False)["input_ids"]
-        return [x[: CFG["max_len"] - 1] + [tok.eos_token_id] for x in bruto]
-
-    indice = {c: i for i, c in enumerate(classes)}
-    return (tokenizar(amostra.text), amostra.model.map(indice).to_numpy(),
-            tokenizar(oficial.text), oficial.model.map(indice).to_numpy(), classes)
+    return tokenizar(amostra.text), amostra.model.map(indice).to_numpy(), ids_of, y_of, classes, prompts
 
 
 class Leitor(nn.Module):
@@ -159,7 +169,7 @@ class Leitor(nn.Module):
 
 
 def montar_modelo(base, dispositivo, tipo, n_classes):
-    from peft import LoraConfig, TaskType, get_peft_model
+    from peft import LoraConfig, PeftModel, TaskType, get_peft_model
     from transformers import AutoConfig, AutoModel
 
     mc = AutoConfig.from_pretrained(base)
@@ -175,13 +185,21 @@ def montar_modelo(base, dispositivo, tipo, n_classes):
     trunk.enable_input_require_grads()
     lora = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION, r=CFG["r"], lora_alpha=2 * CFG["r"], lora_dropout=0.05,
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
-    trunk = get_peft_model(trunk, lora)
+    if CFG["etapa"] == 2:  # retoma o adaptador e as cabeças da etapa 1
+        raiz = Path(CFG["inicio"]) if CFG["inicio"] else Path(achar("cabecas.pt")).parent
+        trunk = PeftModel.from_pretrained(trunk, str(raiz / "adaptador"), is_trainable=True)
+    else:
+        trunk = get_peft_model(trunk, lora)
     for p in trunk.parameters():
         if p.requires_grad:
             p.data = p.data.float()  # só o adaptador treina, em fp32
     leitor = Leitor(trunk, CFG["layers"], mc.hidden_size, n_classes)
     leitor.norms.to(dispositivo)
     leitor.head.to(dispositivo)
+    if CFG["etapa"] == 2:
+        cabecas = torch.load(raiz / "cabecas.pt", map_location=dispositivo)
+        leitor.norms.load_state_dict(cabecas["norms"])
+        leitor.head.load_state_dict(cabecas["head"])
     treinaveis = sum(p.numel() for p in leitor.parameters() if p.requires_grad)
     log(f"modelo com {CFG['keep']} camadas em {dispositivo}/{tipo}, treináveis {treinaveis / 1e6:.1f} M, {MUNDO} GPU(s)")
     return leitor
@@ -395,12 +413,101 @@ def treinar(leitor, ids, y, ids_of, y_of, pad, dispositivo, tipo, resultado):
         log("PERFIL por passo:", json.dumps({k: round(v, 3) for k, v in resultado["perfil_passos"].items()}))
 
 
-def salvar(leitor):
+def salvar(leitor, sufixo=""):
     if RANK != 0:
         return
     saida = Path(CFG["saida"])
-    leitor.trunk.save_pretrained(saida / "adaptador")
-    torch.save({"norms": leitor.norms.state_dict(), "head": leitor.head.state_dict()}, saida / "cabecas.pt")
+    leitor.trunk.save_pretrained(saida / f"adaptador{sufixo}")
+    torch.save({"norms": leitor.norms.state_dict(), "head": leitor.head.state_dict()}, saida / f"cabecas{sufixo}.pt")
+
+
+def nota_pred(y, previsto):
+    return float(np.mean([(previsto[y == c] == c).mean() for c in np.unique(y)]))
+
+
+def intervalo_bootstrap(y, antes, depois, prompts, n=2000, seed=0):
+    """IC95% do ganho em balanced accuracy (depois menos antes), reamostrando prompts inteiros."""
+    rng = np.random.default_rng(seed)
+    unicos = np.unique(prompts)
+    por_prompt = {p: np.where(prompts == p)[0] for p in unicos}
+    deltas = []
+    for _ in range(n):
+        idx = np.concatenate([por_prompt[p] for p in rng.choice(unicos, len(unicos))])
+        deltas.append(nota_pred(y[idx], depois[idx]) - nota_pred(y[idx], antes[idx]))
+    return [float(np.percentile(deltas, 2.5)), float(np.percentile(deltas, 97.5))]
+
+
+def verificar_retomada(leitor, ids_of, pad, dispositivo, tipo, resultado):
+    """A retomada tem de reproduzir os logits que a etapa 1 salvou; senão o adaptador ou as cabeças não carregaram."""
+    salvos = np.load(CFG["logits_etapa1"] or achar("logits_oficial.npy"))
+    n = min(128, len(ids_of))
+    novos = prever(leitor, ids_of[:n], pad, dispositivo, tipo)
+    concordancia = float((novos.argmax(1) == salvos[:n].argmax(1)).mean())
+    resultado["retomada"] = {"textos": n, "concordancia_argmax": concordancia,
+                             "maior_diferenca_logit": float(np.abs(novos - salvos[:n]).max())}
+    log(f"RETOMADA: {concordancia:.3f} de concordância com os logits da etapa 1, maior diferença "
+        f"{resultado['retomada']['maior_diferenca_logit']:.4f}")
+    if concordancia < 0.9:
+        raise RuntimeError(f"a retomada não reproduz a etapa 1 (concordância {concordancia:.3f}): abortando antes de treinar")
+
+
+def executar_etapa2(leitor, ids_of, y_of, prompts, classes, pad, dispositivo, tipo, resultado):
+    """Ajusta nos oficiais, uma dobra por prompt de cada vez, medindo as mesmas passagens antes e depois."""
+    todos = sum(parametros_treinaveis(leitor), [])
+    inicial = [p.detach().clone() for p in todos]
+    verificar_retomada(leitor, ids_of, pad, dispositivo, tipo, resultado)
+
+    def restaurar():
+        with torch.no_grad():
+            for p, p0 in zip(todos, inicial):
+                p.copy_(p0)
+
+    unicos = sorted(set(prompts))
+    antes_pred, depois_pred = np.full(len(y_of), -1), np.full(len(y_of), -1)
+    resultado["dobras"] = []
+    for k in CFG["dobras"]:
+        restaurar()
+        reservados = set(unicos[k :: CFG["n_dobras"]])
+        reservado = np.array([p in reservados for p in prompts])
+        ev, tr = np.where(reservado)[0], np.where(~reservado)[0]
+        ids_ev = [ids_of[i] for i in ev]
+        antes = prever(leitor, ids_ev, pad, dispositivo, tipo).argmax(1)
+        info = {}
+        treinar(leitor, [ids_of[i] for i in tr], y_of[tr], ids_of, y_of, pad, dispositivo, tipo, info)
+        depois = prever(leitor, ids_ev, pad, dispositivo, tipo).argmax(1)
+        antes_pred[ev], depois_pred[ev] = antes, depois
+        d = {"dobra": k, "prompts_reservados": len(reservados), "treino": int(len(tr)), "avaliacao": int(len(ev)),
+             "passos": info["passos"], "passos_pulados": info["passos_pulados"], "perda_final": info["perda_final"],
+             "tempo_treino_s": info["tempo_treino_s"], "ba_antes": nota_pred(y_of[ev], antes),
+             "ba_depois": nota_pred(y_of[ev], depois)}
+        d["delta"] = d["ba_depois"] - d["ba_antes"]
+        resultado["dobras"].append(d)
+        log(f"DOBRA {k}: {len(ev)} passagens reservadas, balanced accuracy {d['ba_antes']:.4f} -> {d['ba_depois']:.4f} "
+            f"({d['delta']:+.4f})")
+
+    medido = antes_pred >= 0
+    y, a, b, pr = y_of[medido], antes_pred[medido], depois_pred[medido], prompts[medido]
+    familia = np.array([c.split("-")[0] for c in classes])
+    resultado["pareado"] = {
+        "passagens": int(medido.sum()), "prompts": int(len(np.unique(pr))),
+        "ba_antes": nota_pred(y, a), "ba_depois": nota_pred(y, b), "delta": nota_pred(y, b) - nota_pred(y, a),
+        "ic95_delta_por_prompt": intervalo_bootstrap(y, a, b, pr),
+        "acuracia_familia_antes": float((familia[a] == familia[y]).mean()),
+        "acuracia_familia_depois": float((familia[b] == familia[y]).mean()),
+        "recall_antes": {classes[c]: float((a[y == c] == c).mean()) for c in np.unique(y)},
+        "recall_depois": {classes[c]: float((b[y == c] == c).mean()) for c in np.unique(y)},
+    }
+    p = resultado["pareado"]
+    log(f"PAREADO ({p['passagens']} passagens, {p['prompts']} prompts): {p['ba_antes']:.4f} -> {p['ba_depois']:.4f} "
+        f"({p['delta']:+.4f}, IC95% {p['ic95_delta_por_prompt'][0]:+.4f} a {p['ic95_delta_por_prompt'][1]:+.4f})")
+
+    if CFG["final_todos"]:  # modelo para enviar: ajuste em todos os oficiais, sem avaliação possível
+        restaurar()
+        info = {}
+        treinar(leitor, ids_of, y_of, ids_of, y_of, pad, dispositivo, tipo, info)
+        salvar(leitor, "_etapa2")
+        resultado["final_todos"] = {"treino": int(len(ids_of)), "passos": info["passos"], "passos_pulados": info["passos_pulados"],
+                                    "perda_final": info["perda_final"]}
 
 
 def main():
@@ -430,8 +537,8 @@ def main():
     base = achar_base()
     tok = AutoTokenizer.from_pretrained(CFG["tokenizer"] or base)
     pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    ids, y, ids_of, y_of, classes = carregar_dados(tok)
-    log(f"{np.mean([len(i) for i in ids]):.0f} tokens por texto do pool em média; {len(ids_of)} textos oficiais para avaliar")
+    ids, y, ids_of, y_of, classes, prompts = carregar_dados(tok, com_pool=CFG["etapa"] != 2)
+    log(f"{np.mean([len(i) for i in ids]) if ids else 0:.0f} tokens por texto do pool em média; {len(ids_of)} textos oficiais")
     t_carga = time.time()
     leitor = montar_modelo(base, dispositivo, tipo, len(classes))
     if MUNDO > 1:  # mesmas cabeças e mesmo LoRA em todas as GPUs, mesmo que a inicialização divirja
@@ -441,6 +548,15 @@ def main():
                  "dispositivo": dispositivo}
     if cuda:
         resultado["gpu"] = torch.cuda.get_device_name(LOCAL)
+
+    if CFG["etapa"] == 2:
+        executar_etapa2(leitor, ids_of, y_of, prompts, classes, pad, dispositivo, tipo, resultado)
+        if RANK == 0:
+            (saida / "resultado.json").write_text(json.dumps(resultado, indent=2, default=float))
+        if MUNDO > 1:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
 
     treinar(leitor, ids, y, ids_of, y_of, pad, dispositivo, tipo, resultado)
 
