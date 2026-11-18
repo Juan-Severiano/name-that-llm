@@ -154,3 +154,26 @@ def test_inferencia_gera_o_mesmo_submission_com_1_e_2_processos_sem_ler_o_train(
     assert list(a.columns) == ["id", "model"] and list(a.id) == [f"t{i}" for i in range(7)]
     assert a.equals(b)  # a divisão entre processos não muda nenhuma previsão
     assert set(a.model) <= set(CLASSES) and a.model.map(type).eq(str).all()
+
+
+@pytest.mark.skipif(not TOKENIZADOR.exists(), reason="tokenizador local do Qwen3-0.6B ausente")
+def test_etapa_1b_continua_numa_segunda_amostra_sem_repetir_a_primeira(tmp_path):
+    pytest.importorskip("peft")
+    modelo_minusculo(tmp_path / "base")
+    dados_falsos(tmp_path)  # 19 textos por classe depois do filtro do proxy
+    comum = {"base": str(tmp_path / "base"), "tokenizer": str(TOKENIZADOR), "oficial": str(tmp_path / "train.csv"), "keep": 4,
+             "layers": [1, 2, 3, 4], "micro_lote": 2, "timeout_min": 2, "processos": 2, "avaliar_cada": 0, "salvar_cada": 0,
+             "pool": str(tmp_path / "pool.parquet")}
+    etapa1 = tmp_path / "etapa1"
+    rodar_script(comum | {"n_pool_por_classe": 8, "max_passos": 4, "saida": str(etapa1)}, tmp_path)
+    etapa1b = tmp_path / "etapa1b"
+    # 19 - 8 = 11 textos novos por classe: pedir 15 obriga a reaproveitar 4 da primeira amostra em cada classe
+    r = rodar_script(comum | {"retomar": True, "inicio": str(etapa1), "logits_etapa1": str(etapa1 / "logits_oficial.npy"),
+                              "pool_excluir_primeira": True, "n_pool_primeira": 8, "n_pool_por_classe": 15, "max_passos": 4,
+                              "saida": str(etapa1b)}, tmp_path)
+    assert "segunda amostra: 198 textos novos e 72 reaproveitados da primeira" in r.stdout  # 18 x 11 novos, 18 x 4 reaproveitados
+    res = json.loads((etapa1b / "resultado.json").read_text())
+    assert res["retomada"]["concordancia_argmax"] == 1.0  # carregou o adaptador e as cabeças da etapa 1
+    p = res["final"]["pareado_vs_etapa1"]
+    assert p["delta"] == pytest.approx(p["ba_depois"] - p["ba_antes"]) and len(p["ic95_delta_por_prompt"]) == 2
+    assert res["passos"] == 4 and res["passos_pulados"] == 0 and res["diferenca_params_entre_gpus"] < 1e-9

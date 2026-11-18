@@ -1,0 +1,24 @@
+{
+  "id": "juanseveriano/ntl-lora24-etapa1b",
+  "title": "ntl-lora24-etapa1b",
+  "code_file": "ntl-lora24-etapa1b.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [
+    "crtproduction/name-that-llm-open-pool"
+  ],
+  "competition_sources": [
+    "name-that-llm"
+  ],
+  "kernel_sources": [
+    "juanseveriano/ntl-lora24-etapa1"
+  ],
+  "model_sources": [
+    "qwen-lm/qwen-3/Transformers/8b-base/1"
+  ],
+  "machine_shape": "NvidiaTeslaT4"
+}

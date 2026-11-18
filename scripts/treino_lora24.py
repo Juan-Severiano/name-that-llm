@@ -68,6 +68,11 @@ CFG = {
     # etapa 3: inferência no teste com o modelo final (não lê train.csv: a reexecução do Kaggle troca a competição)
     "teste": "",  # vazio = procurar test.csv em /kaggle/input
     "sufixo_inicio": "",  # sufixo dos arquivos a carregar: "" na etapa 1, "_etapa2" no modelo final
+    # etapa 1b: continua a etapa 1 numa segunda amostra do pool que não repete a primeira (reaproveita só o que faltar)
+    "retomar": False,  # na etapa 1: parte do adaptador e das cabeças da etapa 1 em vez de começar do zero
+    "pool_excluir_primeira": False,  # tira da amostra os textos que a primeira etapa 1 já usou
+    "n_pool_primeira": 1944,  # por classe, na primeira etapa 1 (a mesma semente 0 a reproduz)
+    "pool_semente": 1,  # semente da segunda amostra
 }
 CLASSES_PADRAO = ["claude-fable-5", "claude-opus-4-6", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5",
                   "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash", "glm-5.3",
@@ -148,7 +153,21 @@ def carregar_dados(tok, com_pool=True):
     oficiais = {normalizar(t) for t in oficial.text}  # nenhum texto oficial pode estar no treino
     pool = pool[~pool.text.map(normalizar).isin(oficiais)].drop_duplicates("text")
     assert set(pool.model) <= set(classes), f"classes do pool fora das oficiais: {set(pool.model) - set(classes)}"
-    amostra = pd.concat([g.sample(min(len(g), CFG["n_pool_por_classe"]), random_state=0) for _, g in pool.groupby("model")])
+    n = CFG["n_pool_por_classe"]
+    if CFG["pool_excluir_primeira"]:  # reproduz a primeira amostra (mesma semente) e tira ela do que resta
+        primeira = pd.concat([g.sample(min(len(g), CFG["n_pool_primeira"]), random_state=0) for _, g in pool.groupby("model")])
+        partes, reaproveitados = [], 0
+        for classe, g in pool.drop(primeira.index).groupby("model"):
+            nova = g.sample(min(len(g), n), random_state=CFG["pool_semente"])
+            falta = n - len(nova)
+            if falta > 0:  # classe sem texto novo suficiente: completa com textos da primeira amostra
+                nova = pd.concat([nova, primeira[primeira.model == classe].sample(falta, random_state=CFG["pool_semente"])])
+                reaproveitados += falta
+            partes.append(nova)
+        amostra = pd.concat(partes)
+        log(f"segunda amostra: {len(amostra) - reaproveitados} textos novos e {reaproveitados} reaproveitados da primeira")
+    else:
+        amostra = pd.concat([g.sample(min(len(g), n), random_state=0) for _, g in pool.groupby("model")])
     amostra = amostra.sample(frac=1, random_state=0).reset_index(drop=True)
     log(f"pool: {n0} linhas, {len(pool)} após filtros, {len(amostra)} na amostra balanceada "
         f"({amostra.model.value_counts().min()} a {amostra.model.value_counts().max()} por classe)")
@@ -193,9 +212,10 @@ def montar_modelo(base, dispositivo, tipo, n_classes):
     lora = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION, r=CFG["r"], lora_alpha=2 * CFG["r"], lora_dropout=0.05,
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
     suf = CFG["sufixo_inicio"]
-    if CFG["etapa"] in (2, 3):  # retoma o adaptador e as cabeças salvos (etapa 2: treina de novo; etapa 3: só infere)
+    retomada = CFG["etapa"] in (2, 3) or CFG["retomar"]
+    if retomada:  # retoma o adaptador e as cabeças salvos (etapas 1b e 2: treina de novo; etapa 3: só infere)
         raiz = Path(CFG["inicio"]) if CFG["inicio"] else Path(achar(f"cabecas{suf}.pt")).parent
-        trunk = PeftModel.from_pretrained(trunk, str(raiz / f"adaptador{suf}"), is_trainable=CFG["etapa"] == 2)
+        trunk = PeftModel.from_pretrained(trunk, str(raiz / f"adaptador{suf}"), is_trainable=CFG["etapa"] != 3)
     else:
         trunk = get_peft_model(trunk, lora)
     for p in trunk.parameters():
@@ -204,7 +224,7 @@ def montar_modelo(base, dispositivo, tipo, n_classes):
     leitor = Leitor(trunk, CFG["layers"], mc.hidden_size, n_classes)
     leitor.norms.to(dispositivo)
     leitor.head.to(dispositivo)
-    if CFG["etapa"] in (2, 3):
+    if retomada:
         cabecas = torch.load(raiz / f"cabecas{suf}.pt", map_location=dispositivo)
         leitor.norms.load_state_dict(cabecas["norms"])
         leitor.head.load_state_dict(cabecas["head"])
@@ -584,6 +604,9 @@ def main():
     if cuda:
         resultado["gpu"] = torch.cuda.get_device_name(LOCAL)
 
+    if CFG["retomar"] and CFG["etapa"] == 1:  # etapa 1b: a retomada tem de reproduzir os logits salvos da etapa 1
+        verificar_retomada(leitor, ids_of, pad, dispositivo, tipo, resultado)
+
     if CFG["etapa"] == 2:
         executar_etapa2(leitor, ids_of, y_of, prompts, classes, pad, dispositivo, tipo, resultado)
         if RANK == 0:
@@ -615,10 +638,18 @@ def main():
         "acuracia_familia": float((familia[previsto] == familia[yv]).mean()),
         "recall_por_classe": {classes[c]: float((previsto[yv == c] == c).mean()) for c in np.unique(yv)},
     }
+    if CFG["retomar"]:  # as mesmas passagens, antes (etapa 1) e depois (etapa 1b): ganho pareado com IC por prompt
+        antes = np.load(CFG["logits_etapa1"] or achar("logits_oficial.npy"))[idx].argmax(1)
+        p = {"ba_antes": nota_pred(yv, antes), "ba_depois": nota_pred(yv, previsto)}
+        p["delta"] = p["ba_depois"] - p["ba_antes"]
+        p["ic95_delta_por_prompt"] = intervalo_bootstrap(yv, antes, previsto, prompts[idx])
+        resultado["final"]["pareado_vs_etapa1"] = p
+        log(f"PAREADO contra a etapa 1: {p['ba_antes']:.4f} -> {p['ba_depois']:.4f} ({p['delta']:+.4f}, IC95% por prompt "
+            f"{p['ic95_delta_por_prompt'][0]:+.4f} a {p['ic95_delta_por_prompt'][1]:+.4f})")
     if RANK == 0:
         np.save(saida / "logits_oficial.npy", logits)
         np.save(saida / "y_oficial.npy", yv)
-        (saida / "resultado.json").write_text(json.dumps(resultado, indent=2))
+        (saida / "resultado.json").write_text(json.dumps(resultado, indent=2, default=float))
     log("FINAL balanced accuracy nos oficiais:", round(resultado["final"]["balanced_accuracy"], 4),
         "| família:", round(resultado["final"]["acuracia_familia"], 4),
         "| passos pulados:", resultado["passos_pulados"], "| diferença entre GPUs:", resultado["diferenca_params_entre_gpus"])

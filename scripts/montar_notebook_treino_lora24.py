@@ -2,6 +2,8 @@
 
   --check   40 passos em ~1.000 textos do pool: prova o NCCL nas duas T4, a escala e o fluxo inteiro (~5 min).
   --etapa1  etapa 1 completa: 34.992 textos balanceados, 1 época (~2.190 passos, ~1,5 h), avaliada nos 2.699 oficiais.
+  --etapa1b continua a etapa 1 por mais uma época numa segunda amostra do pool (35 mil textos que não repetem a primeira,
+            exceto os que faltarem em classes pequenas), avaliada nos mesmos 2.699 oficiais, com ganho pareado (~1,9 h).
   --etapa2  retoma a saída do notebook da etapa 1 e ajusta nos oficiais, reservando prompts inteiros (2 dobras), medindo
             as mesmas passagens antes e depois (~35 min).
   --final   retoma a etapa 1 e ajusta em todos os oficiais, sem avaliação (~16 min); gera o modelo para enviar.
@@ -29,6 +31,10 @@ PERFIS = {
               "titulo": "check curto (40 passos)"},
     "etapa1": {"nome": "ntl-lora24-etapa1", "cfg": {}, "titulo": "etapa 1 completa (~35 mil textos, 1 época)",
                "datasets": [POOL], "kernels": []},
+    "etapa1b": {"nome": "ntl-lora24-etapa1b", "titulo": "etapa 1b (mais uma época, segunda amostra do pool)",
+                "datasets": [POOL], "kernels": [f"{USUARIO}/ntl-lora24-etapa1"], "intro": "etapa1b",
+                "cfg": {"retomar": True, "pool_excluir_primeira": True, "lr_nucleo": 1e-4, "lr_cabeca": 5e-4,
+                        "tempo_maximo_s": 12600}},
     "etapa2": {"nome": "ntl-lora24-etapa2", "titulo": "etapa 2 (ajuste nos oficiais, prompts reservados)", "datasets": [],
                "kernels": [f"{USUARIO}/ntl-lora24-etapa1"], "intro": "etapa2",
                "cfg": {"etapa": 2, "epocas": 2, "lr_nucleo": 5e-5, "lr_cabeca": 5e-4, "dobras": [0, 1], "avaliar_cada": 0,
@@ -50,6 +56,16 @@ paralelos (um processo por GPU, gradientes somados por all_reduce). Treina na am
 (`{pool}`, sem as linhas geradas pelo proxy do Kaggle depois da regra do host de 28/10) e mede nos 2.699 textos
 oficiais, que nunca entram no treino. Entradas: modelo `{modelo}`, dataset `{pool}` e a competição. Internet desligada.
 Código: `scripts/treino_lora24.py`.
+"""
+
+INTRO_ETAPA1B = """# Name That LLM: treino LoRA24, {titulo}
+
+Continua a etapa 1: retoma o adaptador e as cabeças da saída do notebook `juanseveriano/ntl-lora24-etapa1` e treina mais
+uma época em outra amostra balanceada do pool (`{pool}`), com as mesmas filtragens. A amostra não repete a primeira,
+exceto os textos que faltarem em classes com pouco pool (reaproveitados da primeira). Taxas 1e-4 no LoRA e 5e-4 nas
+cabeças, com novo aquecimento. Mede nos mesmos 2.699 oficiais, que nunca entram no treino, e compara com a etapa 1
+passagem a passagem (ganho pareado com intervalo por prompt). Entradas: modelo `{modelo}`, o pool, a etapa 1 e a
+competição. Internet desligada. Código: `scripts/treino_lora24.py`.
 """
 
 INTRO_ETAPA2 = """# Name That LLM: treino LoRA24, {titulo}
@@ -79,7 +95,7 @@ pesos salvos e não usa o `train.csv`, porque a reexecução do Kaggle troca a c
 final e a competição. Internet desligada. Código: `scripts/treino_lora24.py` (etapa 3).
 """
 
-INTROS = {"padrao": INTRO, "etapa2": INTRO_ETAPA2, "final": INTRO_FINAL, "inferencia": INTRO_INFERENCIA}
+INTROS = {"padrao": INTRO, "etapa1b": INTRO_ETAPA1B, "etapa2": INTRO_ETAPA2, "final": INTRO_FINAL, "inferencia": INTRO_INFERENCIA}
 
 CELULA = """import json
 import subprocess
@@ -136,7 +152,7 @@ def metadata(perfil: str) -> dict:
 if __name__ == "__main__":
     perfil = next((p for p in PERFIS if f"--{p}" in sys.argv), None)
     if perfil is None:
-        sys.exit("use --check, --etapa1, --etapa2, --final ou --inferencia")
+        sys.exit("use --check, --etapa1, --etapa1b, --etapa2, --final ou --inferencia")
     nome = PERFIS[perfil]["nome"]
     saida = RAIZ / f"notebook_lora24_{perfil}"
     saida.mkdir(exist_ok=True)
