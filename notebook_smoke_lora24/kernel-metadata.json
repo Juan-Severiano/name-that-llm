@@ -1,0 +1,20 @@
+{
+  "id": "juanseveriano/ntl-smoke-lora24",
+  "title": "ntl-smoke-lora24",
+  "code_file": "ntl-smoke-lora24.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [
+    "crtproduction/name-that-llm-open-pool"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": [
+    "qwen-lm/qwen-3/Transformers/8b-base/1"
+  ],
+  "machine_shape": "NvidiaTeslaT4"
+}
