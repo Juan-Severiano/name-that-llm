@@ -4,6 +4,8 @@
   --etapa1  etapa 1 completa: 34.992 textos balanceados, 1 época (~2.190 passos, ~1,5 h), avaliada nos 2.699 oficiais.
   --etapa2  retoma a saída do notebook da etapa 1 e ajusta nos oficiais, reservando prompts inteiros (2 dobras), medindo
             as mesmas passagens antes e depois (~35 min).
+  --final   retoma a etapa 1 e ajusta em todos os oficiais, sem avaliação (~16 min); gera o modelo para enviar.
+  --inferencia  prevê o teste com a saída do notebook final e grava submission.parquet (a reexecução do placar usa este).
 
 O modelo (qwen-lm/qwen-3/Transformers/8b-base/1), o pool aberto e os dados da competição entram como entradas do
 Kaggle. O código é o de scripts/treino_lora24.py, embutido numa célula que o grava em disco e o executa.
@@ -28,9 +30,17 @@ PERFIS = {
     "etapa1": {"nome": "ntl-lora24-etapa1", "cfg": {}, "titulo": "etapa 1 completa (~35 mil textos, 1 época)",
                "datasets": [POOL], "kernels": []},
     "etapa2": {"nome": "ntl-lora24-etapa2", "titulo": "etapa 2 (ajuste nos oficiais, prompts reservados)", "datasets": [],
-               "kernels": [f"{USUARIO}/ntl-lora24-etapa1"], "intro": "INTRO_ETAPA2",
+               "kernels": [f"{USUARIO}/ntl-lora24-etapa1"], "intro": "etapa2",
                "cfg": {"etapa": 2, "epocas": 2, "lr_nucleo": 5e-5, "lr_cabeca": 5e-4, "dobras": [0, 1], "avaliar_cada": 0,
                        "salvar_cada": 0, "micro_lote": 8, "tempo_maximo_s": 5400}},
+    "final": {"nome": "ntl-lora24-final", "titulo": "ajuste final (todos os oficiais)", "datasets": [],
+              "kernels": [f"{USUARIO}/ntl-lora24-etapa1"], "intro": "final",
+              "cfg": {"etapa": 2, "epocas": 2, "lr_nucleo": 5e-5, "lr_cabeca": 5e-4, "dobras": [], "final_todos": True,
+                      "avaliar_cada": 0, "salvar_cada": 0, "micro_lote": 8, "tempo_maximo_s": 3600}},
+    "inferencia": {"nome": "ntl-lora24-inferencia", "titulo": "inferência no teste", "datasets": [],
+                   "kernels": [f"{USUARIO}/ntl-lora24-final"], "intro": "inferencia",
+                   "cfg": {"etapa": 3, "sufixo_inicio": "_etapa2", "avaliar_cada": 0, "salvar_cada": 0,
+                           "tempo_maximo_s": 3600}},
 }
 
 INTRO = """# Name That LLM: treino LoRA24, {titulo}
@@ -51,6 +61,26 @@ treinar, confere que a retomada reproduz os logits salvos da etapa 1. Entradas: 
 competição. Internet desligada. Código: `scripts/treino_lora24.py`.
 """
 
+INTRO_FINAL = """# Name That LLM: treino LoRA24, {titulo}
+
+Retoma o adaptador e as cabeças da etapa 1 (saída do notebook `juanseveriano/ntl-lora24-etapa1`) e ajusta por 2 épocas
+em TODOS os 2.699 textos oficiais, com as mesmas taxas da etapa 2 (5e-5 no LoRA e 5e-4 nas cabeças). Não há como avaliar
+este modelo: o ganho foi medido antes, com prompts reservados, no notebook da etapa 2. Salva `adaptador_etapa2/` e
+`cabecas_etapa2.pt` (com a lista de classes) para o notebook de inferência. Entradas: modelo `{modelo}`, a etapa 1 e a
+competição. Internet desligada. Código: `scripts/treino_lora24.py`.
+"""
+
+INTRO_INFERENCIA = """# Name That LLM: LoRA24, {titulo}
+
+Prevê o teste com o modelo final (saída do notebook `juanseveriano/ntl-lora24-final`): Qwen3-8B-Base nas 24 primeiras
+camadas com o adaptador da etapa 1 ajustado nos oficiais, em duas T4, uma fatia dos textos por GPU. Lê as classes dos
+pesos salvos e não usa o `train.csv`, porque a reexecução do Kaggle troca a competição por uma versão oculta. Grava
+`submission.parquet` (id, model) pela classe de maior logit, sem balanceamento. Entradas: modelo `{modelo}`, o ajuste
+final e a competição. Internet desligada. Código: `scripts/treino_lora24.py` (etapa 3).
+"""
+
+INTROS = {"padrao": INTRO, "etapa2": INTRO_ETAPA2, "final": INTRO_FINAL, "inferencia": INTRO_INFERENCIA}
+
 CELULA = """import json
 import subprocess
 import sys
@@ -69,6 +99,12 @@ resultado = Path("/kaggle/working/resultado.json")
 if resultado.exists():
     res = json.loads(resultado.read_text())
     print(json.dumps({{k: v for k, v in res.items() if k not in ("config", "historico_perda")}}, indent=2)[:6000])
+envio = Path("/kaggle/working/submission.parquet")
+if envio.exists():
+    import pandas as pd
+
+    sub = pd.read_parquet(envio)
+    print("submission.parquet:", sub.shape, list(sub.columns), sub.model.value_counts().to_dict())
 assert codigo == 0
 """
 
@@ -82,8 +118,7 @@ def notebook(perfil: str) -> dict:
     codigo = (RAIZ / "scripts/treino_lora24.py").read_text()
     assert codigo.count('CFG_JSON = "{}"') == 1
     codigo = codigo.replace('CFG_JSON = "{}"', f"CFG_JSON = {json.dumps(json.dumps(PERFIS[perfil]['cfg']))}")
-    modelo_intro = INTRO_ETAPA2 if PERFIS[perfil].get("intro") == "INTRO_ETAPA2" else INTRO
-    intro = modelo_intro.format(titulo=PERFIS[perfil]["titulo"], pool=POOL, modelo=MODELO)
+    intro = INTROS[PERFIS[perfil].get("intro", "padrao")].format(titulo=PERFIS[perfil]["titulo"], pool=POOL, modelo=MODELO)
     return {"cells": [celula("markdown", intro), celula("code", CELULA.format(script=codigo))],
             "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}},
             "nbformat": 4, "nbformat_minor": 4}
@@ -101,7 +136,7 @@ def metadata(perfil: str) -> dict:
 if __name__ == "__main__":
     perfil = next((p for p in PERFIS if f"--{p}" in sys.argv), None)
     if perfil is None:
-        sys.exit("use --check, --etapa1 ou --etapa2")
+        sys.exit("use --check, --etapa1, --etapa2, --final ou --inferencia")
     nome = PERFIS[perfil]["nome"]
     saida = RAIZ / f"notebook_lora24_{perfil}"
     saida.mkdir(exist_ok=True)

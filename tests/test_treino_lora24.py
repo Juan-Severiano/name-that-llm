@@ -123,3 +123,34 @@ def test_etapa2_retoma_a_etapa1_e_mede_as_mesmas_passagens_antes_e_depois(tmp_pa
     assert abs(p["delta"] - (p["ba_depois"] - p["ba_antes"])) < 1e-12
     assert res["final_todos"]["treino"] == 54
     assert (etapa2 / "adaptador_etapa2/adapter_config.json").exists() and (etapa2 / "cabecas_etapa2.pt").exists()
+
+
+@pytest.mark.skipif(not TOKENIZADOR.exists(), reason="tokenizador local do Qwen3-0.6B ausente")
+def test_inferencia_gera_o_mesmo_submission_com_1_e_2_processos_sem_ler_o_train(tmp_path):
+    pytest.importorskip("peft")
+    modelo_minusculo(tmp_path / "base")
+    dados_falsos(tmp_path)
+    comum = {"base": str(tmp_path / "base"), "tokenizer": str(TOKENIZADOR), "oficial": str(tmp_path / "train.csv"), "keep": 4,
+             "layers": [1, 2, 3, 4], "micro_lote": 2, "timeout_min": 2, "processos": 2, "avaliar_cada": 0, "salvar_cada": 0}
+    etapa1 = tmp_path / "etapa1"
+    rodar_script(comum | {"pool": str(tmp_path / "pool.parquet"), "n_pool_por_classe": 8, "max_passos": 4, "saida": str(etapa1)},
+                 tmp_path)
+    final = tmp_path / "final"  # ajuste final: todos os oficiais, sem dobras
+    rodar_script(comum | {"etapa": 2, "inicio": str(etapa1), "logits_etapa1": str(etapa1 / "logits_oficial.npy"), "dobras": [],
+                          "epocas": 1, "final_todos": True, "saida": str(final)}, tmp_path)
+    res = json.loads((final / "resultado.json").read_text())
+    assert res["dobras"] == [] and "pareado" not in res and res["final_todos"]["treino"] == 54
+
+    rng = np.random.default_rng(7)  # o texto 3 é vazio de propósito
+    pd.DataFrame({"id": [f"t{i}" for i in range(7)], "text": [textos(rng, 50) if i != 3 else "" for i in range(7)]}).to_csv(
+        tmp_path / "test.csv", index=False)
+    saidas = {}
+    for n in (1, 2):
+        s = tmp_path / f"inferencia{n}"
+        rodar_script(comum | {"etapa": 3, "inicio": str(final), "sufixo_inicio": "_etapa2", "teste": str(tmp_path / "test.csv"),
+                              "oficial": "/nao/existe/train.csv", "processos": n, "saida": str(s)}, tmp_path)
+        saidas[n] = pd.read_parquet(s / "submission.parquet")
+    a, b = saidas[1], saidas[2]
+    assert list(a.columns) == ["id", "model"] and list(a.id) == [f"t{i}" for i in range(7)]
+    assert a.equals(b)  # a divisão entre processos não muda nenhuma previsão
+    assert set(a.model) <= set(CLASSES) and a.model.map(type).eq(str).all()

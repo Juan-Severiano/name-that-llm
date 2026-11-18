@@ -65,7 +65,14 @@ CFG = {
     "dobras": [0, 1],  # dobras por prompt reservadas, uma de cada vez: prompts[k::n_dobras]
     "n_dobras": 5,
     "final_todos": False,  # depois das dobras, ajusta em todos os oficiais e salva adaptador_etapa2/ (sem avaliação)
+    # etapa 3: inferência no teste com o modelo final (não lê train.csv: a reexecução do Kaggle troca a competição)
+    "teste": "",  # vazio = procurar test.csv em /kaggle/input
+    "sufixo_inicio": "",  # sufixo dos arquivos a carregar: "" na etapa 1, "_etapa2" no modelo final
 }
+CLASSES_PADRAO = ["claude-fable-5", "claude-opus-4-6", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5",
+                  "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash", "glm-5.3",
+                  "glm-5.3-flash", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "kimi-k3",
+                  "qwen3.8-max"]  # ordem alfabética, a mesma do treino; só serve se as cabeças salvas não trouxerem as classes
 CFG_JSON = "{}"  # o gerador do notebook troca esta linha
 CFG.update(json.loads(os.environ.get("TREINO_CFG", CFG_JSON)))
 
@@ -118,17 +125,17 @@ def normalizar(texto: str) -> str:
     return " ".join(texto.split()).lower()
 
 
+def tokenizar(tok, textos):
+    bruto = tok([str(t).strip() for t in textos], add_special_tokens=False)["input_ids"]
+    return [x[: CFG["max_len"] - 1] + [tok.eos_token_id] for x in bruto]
+
+
 def carregar_dados(tok, com_pool=True):
     oficial = pd.read_csv(CFG["oficial"] or achar("train.csv"), keep_default_na=False)
     classes = sorted(oficial.model.unique())
     assert len(classes) == 18, f"{len(classes)} classes nos oficiais"
     indice = {c: i for i, c in enumerate(classes)}
-
-    def tokenizar(textos):
-        bruto = tok([t.strip() for t in textos], add_special_tokens=False)["input_ids"]
-        return [x[: CFG["max_len"] - 1] + [tok.eos_token_id] for x in bruto]
-
-    ids_of, y_of = tokenizar(oficial.text), oficial.model.map(indice).to_numpy()
+    ids_of, y_of = tokenizar(tok, oficial.text), oficial.model.map(indice).to_numpy()
     prompts = oficial.prompt_id.astype(str).to_numpy()
     if not com_pool:  # etapa 2 só usa os oficiais
         return [], np.zeros(0, dtype=int), ids_of, y_of, classes, prompts
@@ -145,7 +152,7 @@ def carregar_dados(tok, com_pool=True):
     amostra = amostra.sample(frac=1, random_state=0).reset_index(drop=True)
     log(f"pool: {n0} linhas, {len(pool)} após filtros, {len(amostra)} na amostra balanceada "
         f"({amostra.model.value_counts().min()} a {amostra.model.value_counts().max()} por classe)")
-    return tokenizar(amostra.text), amostra.model.map(indice).to_numpy(), ids_of, y_of, classes, prompts
+    return tokenizar(tok, amostra.text), amostra.model.map(indice).to_numpy(), ids_of, y_of, classes, prompts
 
 
 class Leitor(nn.Module):
@@ -185,9 +192,10 @@ def montar_modelo(base, dispositivo, tipo, n_classes):
     trunk.enable_input_require_grads()
     lora = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION, r=CFG["r"], lora_alpha=2 * CFG["r"], lora_dropout=0.05,
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
-    if CFG["etapa"] == 2:  # retoma o adaptador e as cabeças da etapa 1
-        raiz = Path(CFG["inicio"]) if CFG["inicio"] else Path(achar("cabecas.pt")).parent
-        trunk = PeftModel.from_pretrained(trunk, str(raiz / "adaptador"), is_trainable=True)
+    suf = CFG["sufixo_inicio"]
+    if CFG["etapa"] in (2, 3):  # retoma o adaptador e as cabeças salvos (etapa 2: treina de novo; etapa 3: só infere)
+        raiz = Path(CFG["inicio"]) if CFG["inicio"] else Path(achar(f"cabecas{suf}.pt")).parent
+        trunk = PeftModel.from_pretrained(trunk, str(raiz / f"adaptador{suf}"), is_trainable=CFG["etapa"] == 2)
     else:
         trunk = get_peft_model(trunk, lora)
     for p in trunk.parameters():
@@ -196,8 +204,8 @@ def montar_modelo(base, dispositivo, tipo, n_classes):
     leitor = Leitor(trunk, CFG["layers"], mc.hidden_size, n_classes)
     leitor.norms.to(dispositivo)
     leitor.head.to(dispositivo)
-    if CFG["etapa"] == 2:
-        cabecas = torch.load(raiz / "cabecas.pt", map_location=dispositivo)
+    if CFG["etapa"] in (2, 3):
+        cabecas = torch.load(raiz / f"cabecas{suf}.pt", map_location=dispositivo)
         leitor.norms.load_state_dict(cabecas["norms"])
         leitor.head.load_state_dict(cabecas["head"])
     treinaveis = sum(p.numel() for p in leitor.parameters() if p.requires_grad)
@@ -418,7 +426,8 @@ def salvar(leitor, sufixo=""):
         return
     saida = Path(CFG["saida"])
     leitor.trunk.save_pretrained(saida / f"adaptador{sufixo}")
-    torch.save({"norms": leitor.norms.state_dict(), "head": leitor.head.state_dict()}, saida / f"cabecas{sufixo}.pt")
+    torch.save({"norms": leitor.norms.state_dict(), "head": leitor.head.state_dict(),
+                "classes": getattr(leitor, "classes", None)}, saida / f"cabecas{sufixo}.pt")
 
 
 def nota_pred(y, previsto):
@@ -485,21 +494,22 @@ def executar_etapa2(leitor, ids_of, y_of, prompts, classes, pad, dispositivo, ti
         log(f"DOBRA {k}: {len(ev)} passagens reservadas, balanced accuracy {d['ba_antes']:.4f} -> {d['ba_depois']:.4f} "
             f"({d['delta']:+.4f})")
 
-    medido = antes_pred >= 0
-    y, a, b, pr = y_of[medido], antes_pred[medido], depois_pred[medido], prompts[medido]
-    familia = np.array([c.split("-")[0] for c in classes])
-    resultado["pareado"] = {
-        "passagens": int(medido.sum()), "prompts": int(len(np.unique(pr))),
-        "ba_antes": nota_pred(y, a), "ba_depois": nota_pred(y, b), "delta": nota_pred(y, b) - nota_pred(y, a),
-        "ic95_delta_por_prompt": intervalo_bootstrap(y, a, b, pr),
-        "acuracia_familia_antes": float((familia[a] == familia[y]).mean()),
-        "acuracia_familia_depois": float((familia[b] == familia[y]).mean()),
-        "recall_antes": {classes[c]: float((a[y == c] == c).mean()) for c in np.unique(y)},
-        "recall_depois": {classes[c]: float((b[y == c] == c).mean()) for c in np.unique(y)},
-    }
-    p = resultado["pareado"]
-    log(f"PAREADO ({p['passagens']} passagens, {p['prompts']} prompts): {p['ba_antes']:.4f} -> {p['ba_depois']:.4f} "
-        f"({p['delta']:+.4f}, IC95% {p['ic95_delta_por_prompt'][0]:+.4f} a {p['ic95_delta_por_prompt'][1]:+.4f})")
+    if CFG["dobras"]:  # sem dobras (ajuste final direto) não há o que comparar
+        medido = antes_pred >= 0
+        y, a, b, pr = y_of[medido], antes_pred[medido], depois_pred[medido], prompts[medido]
+        familia = np.array([c.split("-")[0] for c in classes])
+        resultado["pareado"] = {
+            "passagens": int(medido.sum()), "prompts": int(len(np.unique(pr))),
+            "ba_antes": nota_pred(y, a), "ba_depois": nota_pred(y, b), "delta": nota_pred(y, b) - nota_pred(y, a),
+            "ic95_delta_por_prompt": intervalo_bootstrap(y, a, b, pr),
+            "acuracia_familia_antes": float((familia[a] == familia[y]).mean()),
+            "acuracia_familia_depois": float((familia[b] == familia[y]).mean()),
+            "recall_antes": {classes[c]: float((a[y == c] == c).mean()) for c in np.unique(y)},
+            "recall_depois": {classes[c]: float((b[y == c] == c).mean()) for c in np.unique(y)},
+        }
+        p = resultado["pareado"]
+        log(f"PAREADO ({p['passagens']} passagens, {p['prompts']} prompts): {p['ba_antes']:.4f} -> {p['ba_depois']:.4f} "
+            f"({p['delta']:+.4f}, IC95% {p['ic95_delta_por_prompt'][0]:+.4f} a {p['ic95_delta_por_prompt'][1]:+.4f})")
 
     if CFG["final_todos"]:  # modelo para enviar: ajuste em todos os oficiais, sem avaliação possível
         restaurar()
@@ -508,6 +518,28 @@ def executar_etapa2(leitor, ids_of, y_of, prompts, classes, pad, dispositivo, ti
         salvar(leitor, "_etapa2")
         resultado["final_todos"] = {"treino": int(len(ids_of)), "passos": info["passos"], "passos_pulados": info["passos_pulados"],
                                     "perda_final": info["perda_final"]}
+
+
+def inferir(tok, base, pad, dispositivo, tipo, saida):
+    """Etapa 3: prevê o teste com o modelo final e grava submission.parquet (id, model). Não lê train.csv."""
+    suf = CFG["sufixo_inicio"]
+    raiz = Path(CFG["inicio"]) if CFG["inicio"] else Path(achar(f"cabecas{suf}.pt")).parent
+    classes = torch.load(raiz / f"cabecas{suf}.pt", map_location="cpu").get("classes") or CLASSES_PADRAO
+    leitor = montar_modelo(base, dispositivo, tipo, len(classes))
+    teste = pd.read_csv(CFG["teste"] or achar("test.csv"), keep_default_na=False)
+    log(f"teste: {len(teste)} textos; {len(classes)} classes")
+    t0 = time.time()
+    logits = prever(leitor, tokenizar(tok, teste.text), pad, dispositivo, tipo)
+    previsto = np.array(classes)[logits.argmax(1)]
+    if RANK == 0:
+        pd.DataFrame({"id": teste["id"].astype(str), "model": previsto}).to_parquet(saida / "submission.parquet", index=False)
+        np.save(saida / "logits_teste.npy", logits)
+        contagem = pd.Series(previsto).value_counts()
+        log(f"submission.parquet com {len(previsto)} linhas em {time.time() - t0:.0f}s; classes previstas: "
+            f"{contagem.min()} a {contagem.max()} por classe ({len(contagem)} de {len(classes)})")
+    if MUNDO > 1:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def main():
@@ -537,10 +569,13 @@ def main():
     base = achar_base()
     tok = AutoTokenizer.from_pretrained(CFG["tokenizer"] or base)
     pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    if CFG["etapa"] == 3:
+        return inferir(tok, base, pad, dispositivo, tipo, saida)
     ids, y, ids_of, y_of, classes, prompts = carregar_dados(tok, com_pool=CFG["etapa"] != 2)
     log(f"{np.mean([len(i) for i in ids]) if ids else 0:.0f} tokens por texto do pool em média; {len(ids_of)} textos oficiais")
     t_carga = time.time()
     leitor = montar_modelo(base, dispositivo, tipo, len(classes))
+    leitor.classes = classes  # vai junto com as cabeças salvas: a inferência não precisa do train.csv
     if MUNDO > 1:  # mesmas cabeças e mesmo LoRA em todas as GPUs, mesmo que a inicialização divirja
         for p in sum(parametros_treinaveis(leitor), []):
             dist.broadcast(p.data, 0)

@@ -1,0 +1,22 @@
+{
+  "id": "juanseveriano/ntl-lora24-inferencia",
+  "title": "ntl-lora24-inferencia",
+  "code_file": "ntl-lora24-inferencia.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": [
+    "name-that-llm"
+  ],
+  "kernel_sources": [
+    "juanseveriano/ntl-lora24-final"
+  ],
+  "model_sources": [
+    "qwen-lm/qwen-3/Transformers/8b-base/1"
+  ],
+  "machine_shape": "NvidiaTeslaT4"
+}
